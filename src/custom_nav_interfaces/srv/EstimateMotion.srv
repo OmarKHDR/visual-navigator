@@ -1,0 +1,4 @@
+bool empty
+---
+string direction
+bool reliable

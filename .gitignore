@@ -1,0 +1,9 @@
+*.mp4
+install/
+build/
+log/
+.venv/
+__pycache__/
+.vscode/
+*.pyc
+*.mkv
