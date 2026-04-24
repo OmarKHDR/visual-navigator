@@ -1,108 +1,81 @@
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
 from std_msgs.msg import String
-from cv_bridge import CvBridge
-import cv2
-import numpy as np
-import torch
 import json
-from transformers import pipeline
-from PIL import Image as PILImage  # ADD THIS
+import numpy as np
+
+# Estimate of real-world height of objects in meters
+REAL_HEIGHTS_M = {
+    'person': 1.7,
+    'car': 1.5,
+    'chair': 1.0,
+    'door': 2.1,
+    'bottle': 0.25,
+    'cell phone': 0.15,
+    'laptop': 0.25,
+    'dining table': 0.8,
+    'tv': 0.6,
+    'book': 0.2
+}
 
 class DepthEstimationNode(Node):
     def __init__(self):
         super().__init__('depth_estimation_node')
 
-        self.declare_parameter('depth_model_path', 'depth-anything/Depth-Anything-V2-Small-hf')
+        # Focal length in pixels (approximate for typical webcams)
+        self.declare_parameter('focal_length_px', 800.0)
+        self.declare_parameter('depth_threshold', 1.0) # spec parameter
+        
+        self.focal_length_px = self.get_parameter('focal_length_px').value
+        self.depth_threshold = self.get_parameter('depth_threshold').value
 
-        model_path  = self.get_parameter('depth_model_path').value
-        self.bridge = CvBridge()
-
-        self.get_logger().info('Loading DepthAnythingV2 model (first run may take a moment)...')
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-        self.depth_pipe = pipeline(
-            task='depth-estimation',
-            model=model_path,
-            device=device
-        )
-        self.get_logger().info(f'Depth model loaded on {device}.')
-
+        # Subscribe to objects instead of computing deep depth model
         self.subscription = self.create_subscription(
-            Image, '/camera_frames', self.depth_callback, 10)
-        self.publisher_   = self.create_publisher(String, '/object_depth', 10)
+            String, '/object_data', self.object_data_callback, 10
+        )
+        self.publisher_ = self.create_publisher(String, '/depth_data', 10)
 
-        self.get_logger().info('Depth Estimation Node ready.')
+        self.get_logger().info('Geometry-based Depth Estimation Node ready.')
 
-    def depth_callback(self, msg):
-        # Convert ROS image to OpenCV (BGR)
-        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-
-        # Convert BGR numpy array → RGB → PIL Image (what the pipeline expects)
-        frame_rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_image  = PILImage.fromarray(frame_rgb)
-
-        # Run depth estimation
-        result    = self.depth_pipe(pil_image)
-        depth_map = np.array(result['depth'])
-
-        # Normalize to 0-255 for visualization
-        depth_min        = depth_map.min()
-        depth_max        = depth_map.max()
-        depth_normalized = (depth_map - depth_min) / (depth_max - depth_min + 1e-8)
-        depth_uint8      = (depth_normalized * 255).astype(np.uint8)
-
-        # Colorize and show depth window
-        depth_colored = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_MAGMA)
-        cv2.imshow('Depth Estimation', depth_colored)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            cv2.destroyAllWindows()
-            rclpy.shutdown()
+    def object_data_callback(self, msg):
+        try:
+            data = json.loads(msg.data)
+        except json.JSONDecodeError:
             return
 
-        # Divide into 3x3 grid and compute mean depth per region
-        h, w   = depth_normalized.shape
-        cell_h = h // 3
-        cell_w = w // 3
+        objects = data.get('objects', [])
+        
+        depths = []
+        objects_with_depth = []
 
-        region_labels = [
-            'top-left',  'top-center',  'top-right',
-            'mid-left',  'center',      'mid-right',
-            'bot-left',  'bot-center',  'bot-right'
-        ]
+        for obj in objects:
+            cls = obj.get('class', 'unknown').lower()
+            x1, y1, x2, y2 = obj.get('bbox', [0, 0, 0, 0])
+            pixel_height = max(1, y2 - y1)  # avoid div by zero
+            
+            # Default to 0.5m if object height is unknown
+            real_h = REAL_HEIGHTS_M.get(cls, 0.5) 
 
-        regions = {}
-        for i, label in enumerate(region_labels):
-            r, c = divmod(i, 3)
-            region         = depth_normalized[r*cell_h:(r+1)*cell_h, c*cell_w:(c+1)*cell_w]
-            regions[label] = round(float(np.mean(region)), 4)
+            # Geometry Distance Formula: Z = (f * H) / h
+            estimated_distance = (self.focal_length_px * real_h) / pixel_height
+            
+            obj_depth_info = {
+                'class': cls,
+                'distance': estimated_distance
+            }
+            objects_with_depth.append(obj_depth_info)
+            depths.append(estimated_distance)
 
-        closest_region = max(regions, key=regions.get)
-        closest_value  = regions[closest_region]
-
-        depth_data = {
-            'mean_depth':     round(float(np.mean(depth_normalized)), 4),
-            'min_depth':      round(float(depth_normalized.min()), 4),
-            'max_depth':      round(float(depth_normalized.max()), 4),
-            'closest_region': closest_region,
-            'closest_value':  closest_value,
-            'regions':        regions
+        out_data = {
+            'mean_depth': round(float(np.mean(depths)) if depths else 999.0, 3),
+            'min_depth': round(float(np.min(depths)) if depths else 999.0, 3),
+            'objects_depth': objects_with_depth,
+            'too_close': any(d < self.depth_threshold for d in depths)
         }
 
-        out_msg      = String()
-        out_msg.data = json.dumps(depth_data)
+        out_msg = String()
+        out_msg.data = json.dumps(out_data)
         self.publisher_.publish(out_msg)
-
-        self.get_logger().info(
-            f'Depth published | Mean: {depth_data["mean_depth"]:.3f} '
-            f'| Closest: {closest_region} ({closest_value:.3f})'
-        )
-
-    def destroy_node(self):
-        cv2.destroyAllWindows()
-        super().destroy_node()
-
 
 def main(args=None):
     rclpy.init(args=args)
