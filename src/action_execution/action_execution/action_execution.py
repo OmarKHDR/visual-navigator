@@ -1,8 +1,9 @@
 import rclpy
 from rclpy.node import Node
-from rclpy.action import ActionServer
+from rclpy.action import ActionClient
+from std_msgs.msg import String
 from custom_nav_interfaces.action import Navigate
-import time
+import json
 
 class ActionExecutionNode(Node):
     def __init__(self):
@@ -11,48 +12,69 @@ class ActionExecutionNode(Node):
         self.declare_parameter('action_duration', 2.0)
         self.action_duration = self.get_parameter('action_duration').value
 
-        self._action_server = ActionServer(
-            self,
-            Navigate,
-            '/navigate_action',
-            self.execute_callback
+        # Subscribes to /navigation_command (per table 3.8 and 4)
+        self.command_sub = self.create_subscription(
+            String, '/navigation_command', self.command_callback, 10
         )
 
-        self.get_logger().info(f'Real Action Server started for /navigate_action | Duration: {self.action_duration}s')
+        # Publishes to /action_status (per table 3.8)
+        self.status_pub = self.create_publisher(String, '/action_status', 10)
 
-    def execute_callback(self, goal_handle):
-        self.get_logger().info(
-            f'Executing goal -> Command: {goal_handle.request.command} '
-            f'| Reason: {goal_handle.request.reason}'
-        )
+        # Uses Action (Consumer of /navigate_action) (per table 3.8 and 4)
+        self._action_client = ActionClient(self, Navigate, '/navigate_action')
 
-        feedback_msg = Navigate.Feedback()
-        steps = 10
-        duration = self.action_duration
+        self.get_logger().info('Action Execution Node started (Bridge to ActionServer).')
 
-        for i in range(steps):
-            if goal_handle.is_cancel_requested:
-                goal_handle.canceled()
-                self.get_logger().info('Goal canceled.')
-                result = Navigate.Result()
-                result.success = False
-                result.final_status = 'CANCELLED'
-                return result
+    def command_callback(self, msg):
+        try:
+            data = json.loads(msg.data)
+            command = data.get('command', 'STOP')
+            reason = data.get('reason', '')
+            priority = data.get('priority', 'LOW')
+        except json.JSONDecodeError:
+            return
 
-            feedback_msg.progress = float(i) / steps
-            feedback_msg.status = 'IN_PROGRESS'
-            goal_handle.publish_feedback(feedback_msg)
-            
-            self.get_logger().info(f'Action Progress: {feedback_msg.progress * 100:.0f}%')
-            time.sleep(duration / steps)
+        if not self._action_client.wait_for_server(timeout_sec=1.0):
+            self.publish_status(command, 'SERVER_UNAVAILABLE', reason)
+            return
 
-        goal_handle.succeed()
+        goal_msg = Navigate.Goal()
+        goal_msg.command = command
+        goal_msg.reason = reason
+        goal_msg.priority = priority
 
-        result = Navigate.Result()
-        result.success = True
-        result.final_status = 'COMPLETED'
-        self.get_logger().info('Goal succeeded.')
-        return result
+        self._action_client.send_goal_async(
+            goal_msg, feedback_callback=self.feedback_callback
+        ).add_done_callback(self.goal_response_callback)
+
+    def publish_status(self, command, status, reason, progress=0.0):
+        out_msg = String()
+        out_msg.data = json.dumps({
+            'command': command,
+            'status': status,
+            'reason': reason,
+            'progress': progress
+        })
+        self.status_pub.publish(out_msg)
+        self.get_logger().info(f'[{status}] {command} ({progress:.0f}%)')
+
+    def goal_response_callback(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.publish_status('UNKNOWN', 'REJECTED', 'Goal rejected by Action Server')
+            return
+
+        self.publish_status('UNKNOWN', 'ACCEPTED', 'Goal accepted')
+        goal_handle.get_result_async().add_done_callback(self.get_result_callback)
+
+    def feedback_callback(self, feedback_msg):
+        feedback = feedback_msg.feedback
+        self.publish_status('UNKNOWN', feedback.status, 'Providing feedback', feedback.progress * 100)
+
+    def get_result_callback(self, future):
+        result = future.result().result
+        status = 'COMPLETED' if result.success else result.final_status
+        self.publish_status('UNKNOWN', status, 'Action finished')
 
 def main(args=None):
     rclpy.init(args=args)

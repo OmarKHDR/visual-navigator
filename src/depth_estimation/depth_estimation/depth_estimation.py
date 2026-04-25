@@ -1,10 +1,12 @@
 import rclpy
 from rclpy.node import Node
+from sensor_msgs.msg import Image
 from std_msgs.msg import String
 import json
 import numpy as np
+from cv_bridge import CvBridge
+from ultralytics import YOLO
 
-# Estimate of real-world height of objects in meters
 REAL_HEIGHTS_M = {
     'person': 1.7,
     'car': 1.5,
@@ -22,49 +24,44 @@ class DepthEstimationNode(Node):
     def __init__(self):
         super().__init__('depth_estimation_node')
 
-        # Focal length in pixels (approximate for typical webcams)
         self.declare_parameter('focal_length_px', 800.0)
-        self.declare_parameter('depth_threshold', 1.0) # spec parameter
+        self.declare_parameter('depth_threshold', 1.0)
         
         self.focal_length_px = self.get_parameter('focal_length_px').value
         self.depth_threshold = self.get_parameter('depth_threshold').value
 
-        # Subscribe to objects instead of computing deep depth model
+        # Enforced by table: Subscribes STRICTLY to /camera_frames
         self.subscription = self.create_subscription(
-            String, '/object_data', self.object_data_callback, 10
+            Image, '/camera_frames', self.frame_callback, 10
         )
         self.publisher_ = self.create_publisher(String, '/depth_data', 10)
 
+        self.bridge = CvBridge()
+        self.model = YOLO('yolov8n.pt')
+
         self.get_logger().info('Geometry-based Depth Estimation Node ready.')
 
-    def object_data_callback(self, msg):
-        try:
-            data = json.loads(msg.data)
-        except json.JSONDecodeError:
-            return
+    def frame_callback(self, msg):
+        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        results = self.model(frame, verbose=False)
 
-        objects = data.get('objects', [])
-        
         depths = []
         objects_with_depth = []
 
-        for obj in objects:
-            cls = obj.get('class', 'unknown').lower()
-            x1, y1, x2, y2 = obj.get('bbox', [0, 0, 0, 0])
-            pixel_height = max(1, y2 - y1)  # avoid div by zero
-            
-            # Default to 0.5m if object height is unknown
-            real_h = REAL_HEIGHTS_M.get(cls, 0.5) 
-
-            # Geometry Distance Formula: Z = (f * H) / h
-            estimated_distance = (self.focal_length_px * real_h) / pixel_height
-            
-            obj_depth_info = {
-                'class': cls,
-                'distance': estimated_distance
-            }
-            objects_with_depth.append(obj_depth_info)
-            depths.append(estimated_distance)
+        for result in results:
+            for box in result.boxes:
+                cls = result.names[int(box.cls)].lower()
+                x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+                pixel_height = max(1, y2 - y1)
+                
+                real_h = REAL_HEIGHTS_M.get(cls, 0.5)
+                estimated_distance = (self.focal_length_px * real_h) / pixel_height
+                
+                objects_with_depth.append({
+                    'class': cls,
+                    'distance': estimated_distance
+                })
+                depths.append(estimated_distance)
 
         out_data = {
             'mean_depth': round(float(np.mean(depths)) if depths else 999.0, 3),
