@@ -17,6 +17,9 @@ It is divided into 8 distinct ROS 2 nodes alongside a custom interface package.
 
 ---
 
+## Graph of The Desired Structure
+<img src="./ros_node_graph.svg"/>
+
 ## Building the Workspace
 
 1. Open your terminal in the root of the workspace (e.g. `task-4`).

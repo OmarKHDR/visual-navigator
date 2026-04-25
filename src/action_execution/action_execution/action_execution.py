@@ -12,15 +12,12 @@ class ActionExecutionNode(Node):
         self.declare_parameter('action_duration', 2.0)
         self.action_duration = self.get_parameter('action_duration').value
 
-        # Subscribes to /navigation_command (per table 3.8 and 4)
         self.command_sub = self.create_subscription(
             String, '/navigation_command', self.command_callback, 10
         )
 
-        # Publishes to /action_status (per table 3.8)
         self.status_pub = self.create_publisher(String, '/action_status', 10)
 
-        # Uses Action (Consumer of /navigate_action) (per table 3.8 and 4)
         self._action_client = ActionClient(self, Navigate, '/navigate_action')
 
         self.get_logger().info('Action Execution Node started (Bridge to ActionServer).')

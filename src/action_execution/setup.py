@@ -24,6 +24,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'action_execution = action_execution.action_execution:main',
+            'mock_command_pub = action_execution.mock_command_pub:main',
+            'mock_action_server = action_execution.mock_action_server:main',
         ],
     },
 )
